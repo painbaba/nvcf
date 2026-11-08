@@ -50,6 +50,7 @@ go_test(
         "quarantine_e2e_test.go",
         "service_test.go",
         "settings_e2e_test.go",
+        "spoolcheck_e2e_test.go",
         "startup_e2e_test.go",
         "stranded_e2e_test.go",
         "suppression_e2e_test.go",
@@ -69,6 +70,7 @@ go_test(
         "//src/compute-plane-services/request-trace-uploader/journal",
         "//src/compute-plane-services/request-trace-uploader/record",
         "//src/compute-plane-services/request-trace-uploader/telemetry",
+        "//src/compute-plane-services/request-trace-uploader/transform",
         "//src/compute-plane-services/request-trace-uploader/uploadertest",
     ],
 )

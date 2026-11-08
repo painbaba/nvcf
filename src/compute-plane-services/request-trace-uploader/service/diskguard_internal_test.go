@@ -5,6 +5,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/diskguard"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/journalfs"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/journal"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/uploadertest"
@@ -131,5 +133,33 @@ func TestEvictionRecordsTheLossBeforeDeleting(t *testing.T) {
 	got, _ := f.u.store.Segment(seg.ID)
 	if got.State != journal.StateDone || got.Reason != journal.ReasonEvicted {
 		t.Fatalf("segment = %s/%s after a failed delete, want done/evicted so it is never prepared from a missing file", got.State, got.Reason)
+	}
+}
+
+func TestAnEvictionWhoseDirectorySyncFailedIsStillReportedAsADeletion(t *testing.T) {
+	for _, keyed := range []string{"journal entry", "bare file"} {
+		t.Run(keyed, func(t *testing.T) {
+			f := newEvictionFixture(t)
+			key := evictFile + filepath.Base(f.closed)
+			if keyed == "journal entry" {
+				size, mtime := f.fileIdentity(t)
+				key = evictSegment + f.discover(t, "4444444444444444444444444444444444444444444444444444444444444444", size, mtime).ID
+			}
+			// The spool directory allows the delete but cannot be opened to
+			// sync it, so the file is gone and the sync fails.
+			dir := filepath.Dir(f.closed)
+			if err := os.Chmod(dir, 0o300); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+			err := (spoolSegments{u: f.u}).Evict(key)
+			if !errors.Is(err, diskguard.ErrDeletedNotSynced) {
+				t.Fatalf("Evict() error = %v, want %v so the guard counts the deletion", err, diskguard.ErrDeletedNotSynced)
+			}
+			if _, statErr := os.Stat(f.closed); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("source after Evict: %v, want it deleted", statErr)
+			}
+		})
 	}
 }

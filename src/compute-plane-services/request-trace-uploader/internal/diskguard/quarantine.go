@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 )
 
 // ErrDeletedNotSynced reports data that was deleted but whose directory
@@ -27,12 +28,19 @@ var onSync func(dir string)
 // source.
 const RejectsDirName = "rejects"
 
+// rejectTempSuffix ends the name of a reject artifact still being written;
+// transform.RejectFile writes under such a name and renames it when done.
+const rejectTempSuffix = ".tmp"
+
 // Quarantine is the quarantine directory on the spool volume:
 //
 //	<dir>/<segment id>/          a quarantined segment and its files
 //	<dir>/rejects/<segment id>.* reject artifacts
 type Quarantine struct {
 	dir string
+	// mu keeps a removal from running while an entry is being admitted, so
+	// an entry is never removed half built.
+	mu sync.Mutex
 }
 
 // NewQuarantine returns the quarantine at dir.
@@ -54,6 +62,8 @@ func (q *Quarantine) Admit(id string, paths ...string) error {
 	if !validEntryName(id) {
 		return fmt.Errorf("quarantine id %q is not a plain name", id)
 	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	entry := filepath.Join(q.dir, id)
 	if err := mkdirDurable(entry); err != nil {
 		return err
@@ -77,9 +87,11 @@ func (q *Quarantine) Admit(id string, paths ...string) error {
 }
 
 // Entries lists every quarantined segment and every reject artifact, with
-// its size and modification time. A quarantine that does not exist yet is
-// empty.
+// its size and modification time. A reject artifact still being written is
+// marked Busy. A quarantine that does not exist yet is empty.
 func (q *Quarantine) Entries() ([]Candidate, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	items, err := os.ReadDir(q.dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -125,7 +137,14 @@ func (q *Quarantine) rejects() ([]Candidate, error) {
 		if err != nil {
 			return nil, err
 		}
-		entries = append(entries, Candidate{Key: RejectsDirName + "/" + item.Name(), Bytes: size, ModTime: info.ModTime()})
+		entries = append(entries, Candidate{
+			Key:     RejectsDirName + "/" + item.Name(),
+			Bytes:   size,
+			ModTime: info.ModTime(),
+			// A reject artifact is written under a temporary name and renamed
+			// once complete, so a temporary one may still be written.
+			Busy: strings.HasSuffix(item.Name(), rejectTempSuffix),
+		})
 	}
 	return entries, nil
 }
@@ -140,6 +159,8 @@ func (q *Quarantine) Remove(key string) error {
 	if !valid {
 		return fmt.Errorf("quarantine key %q is not an entry", key)
 	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	path := filepath.Join(q.dir, filepath.FromSlash(key))
 	if err := os.RemoveAll(path); err != nil {
 		return fmt.Errorf("remove quarantine entry: %w", err)

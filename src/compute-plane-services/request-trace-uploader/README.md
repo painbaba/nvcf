@@ -53,15 +53,24 @@ volume, so every step survives a restart.
    not left behind, submits what is prepared, polls once more, and releases
    the spool, all within the drain timeout. What is left stays in
    the journal for the next start.
-8. Spool bounds: on every scan pass, quarantine entries older than 7 days
-   are deleted, then the oldest entries until quarantine is under 20% of the
-   spool. If the spool is still above 85% full, the oldest closed segments
-   that are in no batch are deleted. A segment in a batch that may have been
-   sent, and the active segment, are never deleted. Preparing pauses while
-   the spool is above 85%, while free space is under 512 MiB or twice the
-   next segment's size, or while 16 prepared segments wait for a batch;
-   prepared work is still sent. Every deletion is counted in
-   `segments_evicted` or `quarantine_evicted`.
+8. Spool bounds: every 10 seconds, apart from scan passes so a long
+   prepare or upload never delays it, the uploader measures the spool,
+   updates the spool gauges, and deletes quarantine entries older than 7
+   days, then the oldest entries until quarantine is under 20% of the
+   spool. A reject artifact still being written is left alone. If the spool
+   is still above the high watermark (90% by default), segments are not
+   deleted then: intake deletes them at its next segment boundary, or at the
+   start of the next pass, so nothing is deleted while a segment is being
+   prepared. The eviction policy deletes data until the spool is down to the
+   low watermark (80% by default): by default quarantine first, then the
+   oldest closed segments that are in no batch. Between the two watermarks
+   nothing is deleted, so deletion is a backstop for a nearly full spool. A
+   segment in a batch that may have been sent, and the active segment, are
+   never deleted. Preparing pauses while the spool is above the high watermark,
+   while free space is under 512 MiB or twice the next segment's size, or
+   while 16 prepared segments wait for a batch; prepared work is still sent.
+   Every deletion is counted in `segments_evicted` or `quarantine_evicted`.
+   The spool and quarantine settings below change these bounds.
 
 Faults follow `internal/retry`: auth failures and outages hold every submit
 without moving a segment; a segment fault quarantines that segment after a
@@ -158,6 +167,28 @@ Optional, with defaults:
 - `REQUEST_TRACE_UPLOADER_QUARANTINE_RESUME_SECONDS`: how long intake stays
   stopped after a trip before it reads new segments again; default `3600`,
   from `60` to `86400`
+- `REQUEST_TRACE_UPLOADER_QUARANTINE_MAX_AGE_SECONDS`: how long a
+  quarantined entry is kept; default `604800` (7 days), from `60` to
+  `2592000` (30 days)
+- `REQUEST_TRACE_UPLOADER_QUARANTINE_MAX_FRACTION`: the largest share of the
+  spool quarantine may hold; default `0.2`, above `0` and at most `1`
+- `REQUEST_TRACE_UPLOADER_SPOOL_CHECK_INTERVAL_SECONDS`: how often the spool
+  is measured and quarantine bounded, apart from scans; default `10`, from
+  `1` to `3600`
+- `REQUEST_TRACE_UPLOADER_SPOOL_HIGH_WATERMARK`: the used share of the spool
+  above which preparing pauses and the eviction policy deletes data; default
+  `0.90`, above `0` and below `1`
+- `REQUEST_TRACE_UPLOADER_SPOOL_LOW_WATERMARK`: the used share the eviction
+  policy frees the spool down to; default `0.80`, above `0` and below the
+  high watermark. Set it too when lowering the high watermark to `0.80` or
+  below.
+- `REQUEST_TRACE_UPLOADER_SPOOL_EVICTION_POLICY`: what is deleted above the
+  high watermark: `quarantine-then-oldest` (default), `oldest` (closed
+  segments only, quarantine kept), or `none` (nothing deleted; preparing
+  pauses until space frees up)
+- `REQUEST_TRACE_UPLOADER_SPOOL_MIN_FREE_BYTES`: free space preparing leaves
+  for the writer; default `536870912` (512 MiB), from `0` to
+  `1099511627776` (1 TiB)
 - `REQUEST_TRACE_UPLOADER_STATUS_INTERVAL_SECONDS`: how often every open job
   is polled, whatever the backend; default `30`
 

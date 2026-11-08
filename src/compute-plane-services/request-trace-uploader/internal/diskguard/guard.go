@@ -4,8 +4,8 @@
 // Package diskguard keeps the spool from filling up. It pauses preparing
 // when free space or the prepare-ahead bound runs out, bounds quarantine by
 // size and age, and above the high watermark deletes per policy, oldest
-// first. Every deletion is counted, because each one is data that will not
-// reach its destination.
+// first, until the spool is down to the low watermark. Every deletion is
+// counted, because each one is data that will not reach its destination.
 package diskguard
 
 import (
@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -45,6 +46,10 @@ type Candidate struct {
 	Key     string
 	Bytes   int64
 	ModTime time.Time
+	// Busy marks an item that may still be written, such as a reject
+	// artifact a prepare is writing. Only Enforce, which runs while nothing
+	// is being prepared, removes it.
+	Busy bool
 }
 
 // QuarantineStore lists and removes quarantined entries. *Quarantine
@@ -104,9 +109,11 @@ type Options struct {
 	Logger  *slog.Logger
 }
 
-// Guard applies the disk rules. Enforce must not run concurrently with
-// itself; the other methods are safe to call at any time.
+// Guard applies the disk rules. Its methods are safe to call at any time;
+// Enforce and Check take turns.
 type Guard struct {
+	// mu keeps Enforce and Check from removing the same entries at once.
+	mu         sync.Mutex
 	cfg        Config
 	volume     Volume
 	quarantine QuarantineStore
@@ -166,11 +173,14 @@ func (g *Guard) AllowPrepare(estimate int64, waiting int) (Decision, error) {
 	return Decision{Allowed: true}, nil
 }
 
-// Enforce first bounds quarantine: entries older than QuarantineMaxAge go,
-// then the oldest until quarantine fits its share of the spool. Then, above
-// the high watermark, it deletes per Policy, oldest first, until the spool
-// is back at the watermark. Every deletion is counted.
-func (g *Guard) Enforce(now time.Time) (Report, error) {
+// Check bounds quarantine as Enforce does, but never evicts a segment and
+// never removes an item that may still be written, so it may run while a
+// segment is being prepared. Report.AboveWatermark says the spool is still
+// above the high watermark, so Enforce must run where nothing is being
+// prepared. Every deletion is counted.
+func (g *Guard) Check(now time.Time) (Report, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	var report Report
 	usage, err := g.volume.Usage()
 	if err != nil {
@@ -180,42 +190,85 @@ func (g *Guard) Enforce(now time.Time) (Report, error) {
 	if err != nil {
 		return report, err
 	}
+	_, err = g.boundQuarantine(now, usage.Total, entries, true, &report)
+	report.AboveWatermark = g.aboveWatermark(usedBytes(usage)-report.FreedBytes, usage.Total)
+	g.logDeleted(report)
+	return report, err
+}
+
+// Enforce first bounds quarantine: entries older than QuarantineMaxAge go,
+// then the oldest until quarantine fits its share of the spool. Then, above
+// the high watermark, it deletes per Policy, oldest first, until the spool
+// is down to the low watermark, so a writer that keeps writing does not
+// trigger a deletion on every pass. Between the two watermarks nothing is
+// deleted. Every deletion is counted. Call it only while no segment is being
+// prepared.
+func (g *Guard) Enforce(now time.Time) (Report, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var report Report
+	usage, err := g.volume.Usage()
+	if err != nil {
+		return report, err
+	}
+	// Without the quarantine list, quarantine cannot go first, so nothing
+	// is deleted.
+	entries, err := g.quarantine.Entries()
+	if err != nil {
+		return report, err
+	}
+	kept, err := g.boundQuarantine(now, usage.Total, entries, false, &report)
+	errs := []error{err}
+	used := usedBytes(usage) - report.FreedBytes
+	if g.aboveWatermark(used, usage.Total) {
+		report.AboveWatermark = true
+		errs = append(errs, g.relieve(used-watermarkBytes(g.cfg.LowWatermark, usage.Total), kept, &report))
+	}
+	g.logDeleted(report)
+	return report, errors.Join(errs...)
+}
+
+// boundQuarantine removes entries older than QuarantineMaxAge, then the
+// oldest until quarantine fits its share of a spool of total bytes. With
+// skipBusy it leaves out items that may still be written. It returns what is
+// kept, oldest first.
+func (g *Guard) boundQuarantine(now time.Time, total uint64, entries []Candidate, skipBusy bool, report *Report) ([]Candidate, error) {
 	sortOldestFirst(entries)
 
 	var errs []error
-	limit := int64(g.cfg.QuarantineMaxFraction * float64(usage.Total))
+	limit := int64(g.cfg.QuarantineMaxFraction * float64(total))
 	var kept []Candidate
 	var held int64
 	for _, e := range entries {
+		if skipBusy && e.Busy {
+			continue
+		}
 		if now.Sub(e.ModTime) > g.cfg.QuarantineMaxAge {
-			errs = append(errs, g.removeQuarantine(e, &report))
+			errs = append(errs, g.removeQuarantine(e, report))
 			continue
 		}
 		kept = append(kept, e)
 		held += e.Bytes
 	}
 	for len(kept) > 0 && held > limit {
-		errs = append(errs, g.removeQuarantine(kept[0], &report))
+		errs = append(errs, g.removeQuarantine(kept[0], report))
 		held -= kept[0].Bytes
 		kept = kept[1:]
 	}
+	return kept, errors.Join(errs...)
+}
 
-	used := usedBytes(usage) - report.FreedBytes
-	if g.aboveWatermark(used, usage.Total) {
-		report.AboveWatermark = true
-		errs = append(errs, g.relieve(used-watermarkBytes(g.cfg.HighWatermark, usage.Total), kept, &report))
-	}
+func (g *Guard) logDeleted(report Report) {
 	if report.QuarantineEvicted > 0 || report.SegmentsEvicted > 0 {
 		g.logger.Warn("deleted spool data to stay within disk bounds",
 			"quarantine_evicted", report.QuarantineEvicted,
 			"segments_evicted", report.SegmentsEvicted,
 			"freed_bytes", report.FreedBytes)
 	}
-	return report, errors.Join(errs...)
 }
 
-// relieve frees need bytes per the policy: quarantine first, then the oldest
-// closed segments.
+// relieve frees need bytes, enough to reach the low watermark, per the
+// policy: quarantine first, then the oldest closed segments.
 func (g *Guard) relieve(need int64, quarantine []Candidate, report *Report) error {
 	if g.cfg.Policy == PolicyNone {
 		g.logger.Warn("spool above the high watermark; preparing paused and nothing deleted by policy")
@@ -256,7 +309,7 @@ func (g *Guard) relieve(need int64, quarantine []Candidate, report *Report) erro
 		}
 	}
 	if freed < need {
-		g.logger.Error("spool still above the high watermark after deleting everything the policy allows",
+		g.logger.Error("spool still above the low watermark after deleting everything the policy allows",
 			"still_needed_bytes", need-freed)
 	}
 	return errors.Join(errs...)

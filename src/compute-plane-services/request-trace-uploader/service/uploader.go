@@ -140,6 +140,9 @@ type Uploader struct {
 	// failures counts failed jobs per segment across replacement batches.
 	failures map[string]int
 	draining atomic.Bool
+	// evictDue is set by the spool check when segments must be evicted.
+	// Intake evicts at its next segment boundary, never mid-prepare.
+	evictDue atomic.Bool
 }
 
 // NewUploader builds the pipeline around an already-built backend. It
@@ -313,7 +316,7 @@ func (u *Uploader) Run(ctx context.Context) error {
 	// It also runs once when the first scan has submitted what it found.
 	scanned := make(chan struct{})
 	var loops sync.WaitGroup
-	loops.Add(2)
+	loops.Add(3)
 	go func() {
 		defer loops.Done()
 		u.loop(work, stop, u.cfg.ScanInterval, u.scan, nil, func() { close(scanned) })
@@ -321,6 +324,12 @@ func (u *Uploader) Run(ctx context.Context) error {
 	go func() {
 		defer loops.Done()
 		u.loop(work, stop, u.pollInterval(), u.Poll, scanned, nil)
+	}()
+	// The spool check runs on its own interval, so a long prepare or submit
+	// never delays it.
+	go func() {
+		defer loops.Done()
+		u.loop(work, stop, u.spoolCheckInterval(), u.checkSpool, nil, nil)
 	}()
 
 	select {
@@ -369,6 +378,13 @@ func (u *Uploader) loop(ctx context.Context, stop <-chan struct{}, every time.Du
 		case <-ticker.C:
 		}
 	}
+}
+
+func (u *Uploader) spoolCheckInterval() time.Duration {
+	if u.cfg.Spool.CheckInterval > 0 {
+		return u.cfg.Spool.CheckInterval
+	}
+	return config.DefaultSpoolCheckInterval
 }
 
 func (u *Uploader) pollInterval() time.Duration {
@@ -438,7 +454,7 @@ func (u *Uploader) open(ctx context.Context) error {
 		return err
 	}
 	// Prepare-ahead must let a full batch form; the default already does.
-	guardConfig, _ := diskguard.DefaultConfig().Resolve(batchConfig.MaxSegments)
+	guardConfig, _ := spoolGuardConfig(u.cfg.Spool).Resolve(batchConfig.MaxSegments)
 	volume := u.volume
 	if volume == nil {
 		volume = diskguard.StatVolume(u.cfg.SourceDir)

@@ -5,11 +5,13 @@ go_library(
     srcs = [
         "config.go",
         "pipeline.go",
+        "spool.go",
         "suppression.go",
     ],
     importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config",
     visibility = ["//visibility:public"],
     deps = [
+        "//src/compute-plane-services/request-trace-uploader/internal/diskguard",
         "//src/compute-plane-services/request-trace-uploader/segment",
         "//src/compute-plane-services/request-trace-uploader/transform/suppress",
     ],
@@ -20,6 +22,7 @@ go_test(
     srcs = [
         "config_test.go",
         "settings_test.go",
+        "spool_test.go",
         "status_test.go",
         "suppression_test.go",
     ],
