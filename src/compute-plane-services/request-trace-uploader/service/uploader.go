@@ -23,8 +23,10 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/diskguard"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/health"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/journalfs"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/linebudget"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/retry"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/journal"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/record"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform"
 )
@@ -43,6 +45,10 @@ const lockMargin = 10 * time.Second
 const (
 	// PointPrepared follows the record of a prepared segment.
 	PointPrepared = "prepared"
+	// PointPreparingAlongside follows the record that a segment's prepare
+	// started while an earlier segment's prepare is still running. Only
+	// more than one prepare worker reaches it.
+	PointPreparingAlongside = "preparing-alongside"
 	// PointBatchRecorded follows the record of a batch, before the backend
 	// is called.
 	PointBatchRecorded = "batch-recorded"
@@ -79,6 +85,7 @@ type Options struct {
 	// name.
 	Holder string
 	// Point, when set, is called at each named point. Only tests set it.
+	// It may be called from intake and a submit at the same time.
 	Point func(name string)
 	// Now, when set, replaces the clock that ages jobs. Only tests set it.
 	Now func() time.Time
@@ -131,6 +138,9 @@ type Uploader struct {
 	cleanupMu sync.Mutex
 	// fingerprints is used by intake only.
 	fingerprints map[fileIdentity]string
+	// backlog runs full-batch submits beside intake. Intake sets it before
+	// it starts them and clears it after they end; nil outside a scan.
+	backlog *backlogSubmits
 	// stateMu guards the maps below, which several stages share.
 	stateMu    sync.Mutex
 	solo       map[string]bool
@@ -156,10 +166,27 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	if err != nil {
 		return nil, err
 	}
+	metrics := opts.Metrics
+	if metrics == nil {
+		metrics = discardMetrics{}
+	}
+	metrics = telemetry.Safe(metrics)
+	memory := cfg.Prepare.MemoryBytes
+	if memory <= 0 {
+		memory = config.DefaultPrepareMemoryBytes
+	}
+	budget, err := linebudget.New(memory, linebudget.Options{OnWait: func() {
+		metrics.Add(telemetry.PrepareMemoryWaits, 1, nil)
+	}})
+	if err != nil {
+		return nil, err
+	}
 	prepareConfig := transform.DefaultConfig()
 	prepareConfig.Suppression = cfg.Suppression
 	prepareConfig.Redact = !cfg.SkipRedaction
-	preparer, err := transform.New(prepareConfig)
+	preparer, err := transform.NewWithOptions(prepareConfig, transform.Options{
+		LineMemory: func(ctx context.Context) record.LineMemory { return budget.Lease(ctx) },
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -185,11 +212,6 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	if err != nil {
 		return nil, err
 	}
-	metrics := opts.Metrics
-	if metrics == nil {
-		metrics = discardMetrics{}
-	}
-	metrics = telemetry.Safe(metrics)
 	telemetry.Preset(metrics)
 	rules.preset(metrics)
 	metrics.Add(telemetry.RecordsDropped, 0, unsupportedVersionLabels())
@@ -425,11 +447,7 @@ func (u *Uploader) open(ctx context.Context) error {
 		return fmt.Errorf("discard transports prepared under another policy: %w", err)
 	}
 	u.cleaner = cleanup.New(cleanupJournal{store: store, point: u.point}, spoolIndex{dir: u.cfg.SourceDir}, cleanup.Options{Counter: counterFor(u.metrics)})
-	limits := batch.Limits{
-		Batching: u.caps.BatchFiles() > 1,
-		MaxBytes: u.caps.MaxBatchBytes,
-		MaxFiles: u.caps.BatchFiles(),
-	}
+	limits := u.batchLimits()
 	// The batch settings are defaults no operator sets, so lowering them to
 	// the backend's limits is expected and not worth a warning.
 	batchConfig, _ := batch.Resolve(batch.DefaultConfig(), limits)

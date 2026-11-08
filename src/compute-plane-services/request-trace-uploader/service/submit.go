@@ -67,6 +67,36 @@ func quarantineLabels(reason string) telemetry.Labels {
 // submits the batches. Lanes are flushed at the end of each call, so a
 // segment waits at most one scan interval, as with the earlier exporter.
 func (u *Uploader) submitPrepared(ctx context.Context) error {
+	return u.submitBatches(ctx, u.batcher, true)
+}
+
+// submitFull submits only the batches that fill up from what is prepared
+// now, so a backlog is sent while it is prepared. It batches on a batcher of
+// its own and drops the lanes that are not full: their members stay
+// prepared and in no batch, for a later call or the end of the pass.
+func (u *Uploader) submitFull(ctx context.Context) error {
+	limits := u.batchLimits()
+	batchConfig, _ := batch.Resolve(batch.DefaultConfig(), limits)
+	batcher, err := batch.New(batchConfig, limits, batch.Options{Metrics: batchMetrics{u.metrics}})
+	if err != nil {
+		return err
+	}
+	return u.submitBatches(ctx, batcher, false)
+}
+
+// batchLimits is what the backend's capabilities allow in one batch.
+func (u *Uploader) batchLimits() batch.Limits {
+	return batch.Limits{
+		Batching: u.caps.BatchFiles() > 1,
+		MaxBytes: u.caps.MaxBatchBytes,
+		MaxFiles: u.caps.BatchFiles(),
+	}
+}
+
+// submitBatches batches every prepared destination that is in no batch on
+// batcher and submits the batches that close. flush also closes and submits
+// every lane that is not full.
+func (u *Uploader) submitBatches(ctx context.Context, batcher *batch.Batcher, flush bool) error {
 	now := time.Now()
 	var batches []batch.Batch
 	var errs []error
@@ -89,7 +119,7 @@ func (u *Uploader) submitPrepared(ctx context.Context) error {
 				PreparedAt:  preparedAt,
 			}
 			if u.isSolo(seg.ID) {
-				solo, err := u.batcher.Solo(member, now)
+				solo, err := batcher.Solo(member, now)
 				if err != nil {
 					errs = append(errs, err)
 					continue
@@ -97,7 +127,7 @@ func (u *Uploader) submitPrepared(ctx context.Context) error {
 				batches = append(batches, solo)
 				continue
 			}
-			closed, err := u.batcher.Add(member, now)
+			closed, err := batcher.Add(member, now)
 			if errors.Is(err, batch.ErrMemberTooLarge) {
 				errs = append(errs, u.quarantineSegment(seg.ID, seg.Index, reasonTooLarge, filepath.Join(u.cfg.SourceDir, seg.Name), dest.Transport.Path))
 				continue
@@ -109,7 +139,9 @@ func (u *Uploader) submitPrepared(ctx context.Context) error {
 			batches = append(batches, closed...)
 		}
 	}
-	batches = append(batches, u.batcher.Due(now.Add(batch.DefaultMaxWait))...)
+	if flush {
+		batches = append(batches, batcher.Due(now.Add(batch.DefaultMaxWait))...)
+	}
 	for _, b := range batches {
 		if err := u.submit(ctx, b, false); err != nil {
 			errs = append(errs, err)
@@ -187,6 +219,9 @@ func (u *Uploader) submit(ctx context.Context, b batch.Batch, resend bool) error
 			err = errors.Join(err, u.store.ReleaseBatch(b.ID))
 		}
 		return fmt.Errorf("record batch before submit: %w", err)
+	}
+	if u.backlog != nil {
+		u.backlog.batched()
 	}
 	receipt, err := batch.Send(ctx, j, u.name, b, u.send)
 	if receipt != "" {

@@ -26,14 +26,27 @@ volume, so every step survives a restart.
    live and not ready until an operator acts.
 2. Intake: each closed segment is fingerprinted (SHA-256) and recorded
    before it is read. The highest indexed segment is never read or deleted.
+   Up to `REQUEST_TRACE_UPLOADER_PREPARE_WORKERS` segments are prepared at
+   once (default one). Results are recorded in spool order whatever order
+   they finish in, and a crash mid-prepare leaves each unfinished segment to
+   be prepared again from its source. Lines longer than 16 MiB share
+   `REQUEST_TRACE_UPLOADER_PREPARE_MEMORY_BYTES` at five times their size:
+   a prepare whose line does not fit waits, counted in
+   `prepare_memory_waits`, and the line that started first never waits, so
+   one line larger than the budget is still read. Each prepare also uses a
+   fixed amount for buffers and shorter lines, which depends on the format
+   writer.
 3. Record handling: suppression, then redaction, then the backend's format
    writer. A backend chooses its transport format by implementing
    `format.Factory` on its client; a backend that takes gzip JSON lines on
    one destination gets the default writer.
 4. Batching: prepared segments are grouped per destination within the
-   backend's file and byte limits, and lanes are flushed every pass. A batch
-   is recorded before the backend is called, and a returned job id is saved
-   before the error is looked at.
+   backend's file and byte limits, and lanes are flushed every pass. While
+   intake is preparing a backlog, each batch that fills up is submitted at
+   once, beside intake, so uploads overlap preparing; a batch that is not
+   full waits for the end of the pass. A batch is recorded before the
+   backend is called, and a returned job id is saved before the error is
+   looked at.
 5. Polling: one loop polls every open job on the status interval. A job is
    pending, succeeded, failed or not found. A job with a saved id is polled,
    never submitted again under that id. A job still pending, or whose status
@@ -47,7 +60,8 @@ volume, so every step survives a restart.
 6. Cleanup: after success, transports are deleted, the source is re-hashed
    if its size or modification time changed, and only then deleted. A
    backend that does not export, such as `debug` or a dry run, never deletes
-   a source.
+   a source. A cleanup round reads the spool's highest index once per
+   segment family, not once per deletion.
 7. Shutdown: on SIGTERM the uploader lets work in progress finish, scans
    the spool one last time so a segment that closed after the last scan is
    not left behind, submits what is prepared, polls once more, and releases
@@ -60,7 +74,9 @@ volume, so every step survives a restart.
    sent, and the active segment, are never deleted. Preparing pauses while
    the spool is above 85%, while free space is under 512 MiB or twice the
    next segment's size, or while 16 prepared segments wait for a batch;
-   prepared work is still sent. Every deletion is counted in
+   prepared work is still sent. Segments being prepared count toward free
+   space. While full batches are sent during a backlog, intake waits at the
+   16-segment bound for the next batch instead of stopping. Every deletion is counted in
    `segments_evicted` or `quarantine_evicted`.
 
 Faults follow `internal/retry`: auth failures and outages hold every submit
@@ -160,6 +176,11 @@ Optional, with defaults:
   from `60` to `86400`
 - `REQUEST_TRACE_UPLOADER_STATUS_INTERVAL_SECONDS`: how often every open job
   is polled, whatever the backend; default `30`
+- `REQUEST_TRACE_UPLOADER_PREPARE_WORKERS`: how many segments are prepared
+  at once; default `1`, from `1` to `16`. Each worker can use one core.
+- `REQUEST_TRACE_UPLOADER_PREPARE_MEMORY_BYTES`: memory that lines longer
+  than 16 MiB share across workers, in bytes; default `1073741824`
+  (1 GiB), from `67108864` (64 MiB) to `68719476736` (64 GiB)
 
 Used only by one backend:
 

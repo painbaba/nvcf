@@ -107,6 +107,9 @@ const (
 	// and duration of the export path.
 	PrepareDuration = "prepare_duration"
 	ExportLatency   = "export_latency"
+	// PrepareMemoryWaits counts prepares that waited for room in the memory
+	// that concurrent prepares share for long lines.
+	PrepareMemoryWaits = "prepare_memory_waits"
 )
 
 // Labels are the attributes of one observation, without BackendLabel.
@@ -218,6 +221,7 @@ var catalog = []Instrument{
 		Values: map[string][]string{"reason": QuarantineReasons}},
 	{Name: PrepareDuration, Kind: Histogram, Unit: "s", Buckets: stepBuckets},
 	{Name: ExportLatency, Kind: Histogram, Unit: "s", Buckets: secondsBuckets},
+	{Name: PrepareMemoryWaits, Kind: Counter, Unit: "1"},
 }
 
 var byName = func() map[string]Instrument {

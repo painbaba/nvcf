@@ -125,6 +125,9 @@ type Config struct {
 	// QuarantineResume is how long intake stays stopped after a trip before
 	// it reads new segments again. Zero uses the fault handling default.
 	QuarantineResume time.Duration
+	// Prepare bounds preparing segments in parallel. The zero value, as in a
+	// Config built by hand, prepares one segment at a time.
+	Prepare PreparePolicy
 }
 
 // ObjectStorePolicy configures the generic S3-compatible backend. Bucket and
@@ -264,6 +267,10 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 	if err != nil {
 		return Config{}, nil, err
 	}
+	prepare, err := preparePolicyValue(lookup)
+	if err != nil {
+		return Config{}, nil, err
+	}
 
 	return Config{
 		SourceDir:     sourceDir,
@@ -293,6 +300,7 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 
 		QuarantineTrip:   quarantineTrip,
 		QuarantineResume: quarantineResume,
+		Prepare:          prepare,
 	}, warnings, nil
 }
 

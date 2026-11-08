@@ -18,9 +18,11 @@ go_test(
     srcs = [
         "cleanup_test.go",
         "contract_test.go",
+        "round_test.go",
     ],
     deps = [
         ":cleanup",
         "//src/compute-plane-services/request-trace-uploader/internal/journalfs",
+        "//src/compute-plane-services/request-trace-uploader/segment",
     ],
 )

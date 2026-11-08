@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "config.go",
         "pipeline.go",
+        "prepare.go",
         "suppression.go",
     ],
     importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config",
@@ -19,6 +20,7 @@ go_test(
     name = "config_test",
     srcs = [
         "config_test.go",
+        "prepare_test.go",
         "settings_test.go",
         "status_test.go",
         "suppression_test.go",

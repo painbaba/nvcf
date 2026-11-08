@@ -1,0 +1,62 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+const (
+	// EnvPrepareWorkers is how many segments are prepared at once. One keeps
+	// the uploader to one core for preparing.
+	EnvPrepareWorkers = "REQUEST_TRACE_UPLOADER_PREPARE_WORKERS"
+	// EnvPrepareMemoryBytes is the memory, in bytes, that the long lines
+	// held by concurrent prepares share. A prepare whose line does not fit
+	// waits for another to finish its line; the line that started first
+	// never waits, so one line larger than the budget is still read.
+	EnvPrepareMemoryBytes = "REQUEST_TRACE_UPLOADER_PREPARE_MEMORY_BYTES"
+
+	DefaultPrepareWorkers     = 1
+	DefaultPrepareMemoryBytes = int64(1) << 30
+
+	maxPrepareWorkers     = 16
+	minPrepareMemoryBytes = int64(64) << 20
+	maxPrepareMemoryBytes = int64(64) << 30
+)
+
+// PreparePolicy bounds preparing segments in parallel.
+type PreparePolicy struct {
+	// Workers is how many segments are prepared at once.
+	Workers int
+	// MemoryBytes is the memory long lines share across workers.
+	MemoryBytes int64
+}
+
+func preparePolicyValue(lookup LookupFunc) (PreparePolicy, error) {
+	workers, err := strictInt(lookup, EnvPrepareWorkers, DefaultPrepareWorkers, 1, maxPrepareWorkers)
+	if err != nil {
+		return PreparePolicy{}, err
+	}
+	memory, err := strictInt64(lookup, EnvPrepareMemoryBytes, DefaultPrepareMemoryBytes, minPrepareMemoryBytes, maxPrepareMemoryBytes)
+	if err != nil {
+		return PreparePolicy{}, err
+	}
+	return PreparePolicy{Workers: workers, MemoryBytes: memory}, nil
+}
+
+// strictInt64 parses a whole-number setting within bounds. A bad value is an
+// error and never a fallback.
+func strictInt64(lookup LookupFunc, name string, fallback, minimum, maximum int64) (int64, error) {
+	value := strings.TrimSpace(valueOrDefault(lookup, name, ""))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < minimum || parsed > maximum {
+		return 0, fmt.Errorf("%s must be a whole number from %d to %d", name, minimum, maximum)
+	}
+	return parsed, nil
+}

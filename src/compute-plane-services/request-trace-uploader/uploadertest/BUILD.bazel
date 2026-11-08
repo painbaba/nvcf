@@ -6,6 +6,8 @@ go_library(
         "crash.go",
         "doc.go",
         "fixtures.go",
+        "loadgen.go",
+        "measure.go",
     ],
     importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/uploadertest",
     visibility = ["//visibility:public"],
@@ -25,6 +27,7 @@ go_test(
         "crash_test.go",
         "fixtures_test.go",
         "harness_test.go",
+        "loadgen_test.go",
     ],
     embed = [":uploadertest"],
     deps = [
@@ -32,5 +35,7 @@ go_test(
         "//src/compute-plane-services/request-trace-uploader/backend/backendtest",
         "//src/compute-plane-services/request-trace-uploader/record",
         "//src/compute-plane-services/request-trace-uploader/segment",
+        "//src/compute-plane-services/request-trace-uploader/transform",
+        "//src/compute-plane-services/request-trace-uploader/transform/suppress",
     ],
 )

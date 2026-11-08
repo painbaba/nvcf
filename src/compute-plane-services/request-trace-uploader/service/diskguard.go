@@ -40,9 +40,9 @@ func (u *Uploader) enforceDiskBounds() {
 	}
 }
 
-// allowPrepare reports whether preparing one more segment of size bytes
-// fits the spool. It logs the reason when preparing pauses.
-func (u *Uploader) allowPrepare(size int64) (bool, error) {
+// allowPrepare decides whether preparing one more segment of size bytes
+// fits the spool. The caller logs a pause.
+func (u *Uploader) allowPrepare(size int64) (diskguard.Decision, error) {
 	waiting := 0
 	for _, seg := range u.store.Segments() {
 		if seg.State == journal.StatePrepared && unbatched(seg) {
@@ -51,12 +51,9 @@ func (u *Uploader) allowPrepare(size int64) (bool, error) {
 	}
 	decision, err := u.guard.AllowPrepare(size, waiting)
 	if err != nil {
-		return false, fmt.Errorf("check spool space: %w", err)
+		return diskguard.Decision{}, fmt.Errorf("check spool space: %w", err)
 	}
-	if !decision.Allowed {
-		slog.Warn("preparing paused to protect the spool; prepared work is still sent", "reason", decision.Reason)
-	}
-	return decision.Allowed, nil
+	return decision, nil
 }
 
 // updateSpoolGauges reports spool use and the pending segments.
